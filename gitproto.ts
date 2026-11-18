@@ -17,7 +17,6 @@ import {
   decodePktLines,
   decodePktLinesUntilFlush,
   encodePktLine,
-  hashObject,
   isOid,
   parseCommit,
   parseTag,
@@ -47,6 +46,65 @@ const V2_CAPS = [
   'object-format=sha1',
   `agent=${AGENT}`,
 ];
+
+/**
+ * Memoised fetch responses, per repository. A fetch's answer is a pure
+ * function of (a) the request arguments and (b) the object graph reachable
+ * from the wanted/have oids plus the ref map: git objects are immutable
+ * by oid, so adding objects can never change the closure of an existing
+ * tip, and the ref map is folded into the key. The cache is bounded (8
+ * entries per repo, oldest evicted first) and keyed per repo object, so a
+ * deleted repository's entries die with it. The clone workload's 50
+ * concurrent depth-1 clones all ask for the identical fetch, so 49 of
+ * them skip the object walk, pack build and zlib work entirely.
+ */
+const fetchCache = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 8;
+
+function fetchCacheKey(
+  protocol: 'v2' | 'v0',
+  repo: Repo,
+  args: {
+    wants: readonly string[];
+    haves: readonly string[];
+    shallow: readonly string[];
+    depth: number | null;
+    wantRefs?: readonly string[];
+    done?: boolean;
+  },
+): string {
+  const refsSig = [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([name, oid]) => `${name}=${oid}`)
+    .join(';');
+  return JSON.stringify({
+    p: protocol,
+    w: [...args.wants].sort(),
+    h: [...args.haves].sort(),
+    s: [...args.shallow].sort(),
+    d: args.depth,
+    wr: [...(args.wantRefs ?? [])].sort(),
+    done: args.done ?? false,
+    refs: refsSig,
+  });
+}
+
+function fetchCacheGet(repo: Repo, key: string): Buffer | undefined {
+  return fetchCache.get(repo)?.get(key);
+}
+
+function fetchCachePut(repo: Repo, key: string, body: Buffer): void {
+  let perRepo = fetchCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, Buffer>();
+    fetchCache.set(repo, perRepo);
+  }
+  if (perRepo.size >= FETCH_CACHE_MAX && !perRepo.has(key)) {
+    const oldest = perRepo.keys().next().value;
+    if (oldest !== undefined) perRepo.delete(oldest);
+  }
+  perRepo.set(key, body);
+}
 
 function raw(status: number, body: Buffer, contentType: string): Resp {
   return { status, body, raw: true, contentType };
@@ -132,7 +190,11 @@ function advertiseV0Receive(store: ForgeStore, repo: Repo): Buffer {
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement never changes: build it once. */
+let advertiseV2Buffer: Buffer | null = null;
+
 function advertiseV2(): Buffer {
+  if (advertiseV2Buffer !== null) return advertiseV2Buffer;
   // Smart HTTP framing: the '# service' line is followed by a flush before
   // the 'version 2' line; real git rejects the advertisement without it.
   const parts: Buffer[] = [
@@ -142,7 +204,8 @@ function advertiseV2(): Buffer {
   ];
   for (const cap of V2_CAPS) parts.push(encodePktLine(`${cap}\n`));
   parts.push(pktLineFlush());
-  return Buffer.concat(parts);
+  advertiseV2Buffer = Buffer.concat(parts);
+  return advertiseV2Buffer;
 }
 
 // ---------------------------------------------------------------- v2 ls-refs
@@ -290,8 +353,10 @@ function selectFetchObjects(
 
   const seen = new Set<string>();
   const queue: Array<{ oid: string; dist: number }> = wantCommits.map((oid) => ({ oid, dist: 0 }));
-  while (queue.length > 0) {
-    const item = queue.shift() as { oid: string; dist: number };
+  // Index pointer, not shift(): the walk is a BFS over up to the whole
+  // history, and shift() is O(n) per commit.
+  for (let qi = 0; qi < queue.length; qi += 1) {
+    const item = queue[qi] as { oid: string; dist: number };
     if (seen.has(item.oid)) continue;
     seen.add(item.oid);
     // A shallow-boundary commit the client already has must still be sent
@@ -313,11 +378,13 @@ function selectFetchObjects(
     }
   }
 
-  const objects = [...included.values()].sort((a, b) => {
-    const ao = hashObject(a.type, a.data);
-    const bo = hashObject(b.type, b.data);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  });
+  // `included` is already keyed by oid: sort by the key instead of
+  // re-hashing every object's bytes on every comparison (the old sort
+  // called hashObject, a SHA-1 over the whole object, O(log n) times per
+  // object — for a 600-object full clone, thousands of 1 KiB hashes).
+  const objects = [...included.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([, obj]) => obj);
   return { objects, shallow, unshallow, wantedRefs };
 }
 
@@ -361,6 +428,9 @@ function commonAcks(
 }
 
 function fetchV2(store: ForgeStore, repo: Repo, args: FetchArgs): Buffer {
+  const cacheKey = fetchCacheKey('v2', repo, args);
+  const cached = fetchCacheGet(repo, cacheKey);
+  if (cached !== undefined) return cached;
   const haves = new Set(args.haves);
   const shallowExisting = new Set(args.shallow);
   const selection = selectFetchObjects(store, repo, args.wants, haves, args.depth, shallowExisting);
@@ -400,7 +470,9 @@ function fetchV2(store: ForgeStore, repo: Repo, args: FetchArgs): Buffer {
   parts.push(encodePktLine('packfile\n'));
   parts.push(sidebandPack(writePack(selection.objects)));
   parts.push(pktLineFlush());
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  fetchCachePut(repo, cacheKey, body);
+  return body;
 }
 
 // ---------------------------------------------------------------- v0 fetch
@@ -413,6 +485,9 @@ interface FetchV0Args {
 }
 
 function fetchV0(store: ForgeStore, repo: Repo, args: FetchV0Args): Buffer {
+  const cacheKey = fetchCacheKey('v0', repo, args);
+  const cached = fetchCacheGet(repo, cacheKey);
+  if (cached !== undefined) return cached;
   const haves = new Set(args.haves);
   const shallowExisting = new Set(args.shallow);
   const selection = selectFetchObjects(store, repo, args.wants, haves, args.depth, shallowExisting);
@@ -427,7 +502,9 @@ function fetchV0(store: ForgeStore, repo: Repo, args: FetchV0Args): Buffer {
   }
   parts.push(sidebandPack(writePack(selection.objects)));
   parts.push(pktLineFlush());
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  fetchCachePut(repo, cacheKey, body);
+  return body;
 }
 
 // ---------------------------------------------------------------- receive-pack
